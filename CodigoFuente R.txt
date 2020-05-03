@@ -1,0 +1,276 @@
+options(repos="https://cran.rstudio.com")
+# Si es la primera vez que se ejecuta el codigo, se debe proceder a poner la Variable a TRUE
+firsttime <- F
+if(firsttime){
+install.packages("knitr")
+install.packages("colorspace")
+install.packages("gplots")
+install.packages("ggplot2")
+install.packages("ggrepel")
+install.packages("htmlTable")
+install.packages("prettydoc")
+install.packages("devtools")
+install.packages("BiocManager")
+BiocManager::install(c("limma","genefilter","pvca","annotate","arrayQualityMetrics","oligo","HG-U133_Plus_2.db","org.Hs.eg.db","ReactomePA","reactome.db"), update = FALSE, ask = FALSE)
+}
+
+#Se definen directorios de trabajo
+setwd("~/UOC_ANNA/ADO_PEC1/ADO_PEC1")
+workingDir <-getwd()
+dataDir <-file.path(workingDir, "data")
+resultsDir <- file.path(workingDir, "results")
+
+#Se requierens las librerias
+library(oligo)
+library(Biobase)
+
+# Lectura archivo objetivos
+targets <- read.csv2("./data/targLimma.txt", header = TRUE, sep = "\t")
+knitr::kable( targets, booktabs = TRUE, caption = 'Content of the targets file used for the current analysis')
+
+# Leer archivos CEL
+celFiles <- list.celfiles("./data", full.names = TRUE)
+my.targets <-read.AnnotatedDataFrame(file.path("./data","targLimma.txt"), header = TRUE, row.names = 1, sep="\t") 
+rawData <- read.celfiles(celFiles, phenoData = my.targets)
+
+my.targets@data$Name->rownames(pData(rawData))
+colnames(rawData) <-rownames(pData(rawData)) 
+
+#Se muestra parte de los resultados de las acciones
+head(rawData)
+
+head(targets)
+
+#Se ejecuta el informe de calidad de los arrays
+
+library(arrayQualityMetrics)
+arrayQualityMetrics(rawData)
+
+# Se muestra un boxplot de Distribución de valores de intensidad con los datos rawdata
+boxplot(rawData, cex.axis=0.5, las=2,  
+        col = c(rep("red", 3), rep("blue", 3), rep("green", 3), rep("yellow", 3)),
+        main="Distribución de valores de intensidad - datos raw")
+
+#Se ejecuta la normalizacion de los datos y se guarda a eset_rma
+		
+eset_rma <- rma(rawData)
+
+#Se vuelve a ejecutar el informe de calidad de los arrays una vez eliminados los defectuosos y se guarda el informe en la carpeta resultados
+
+library(arrayQualityMetrics)
+arrayQualityMetrics(eset_rma, outdir = file.path(resultsDir, "QCDir.Norm"), force=TRUE)
+
+# Se muestra un boxplot de Distribución de valores de intensidad con los datos normalizados
+
+boxplot(eset_rma, cex.axis=0.5, las=2,   
+        col = c(rep("red", 3), rep("blue", 3), rep("green", 3), rep("yellow", 3)),
+        main="Distribución de valores de intensidad - datos normalizados")
+
+# Se filtran los datos normalizados y se guardan en la carpeta resultados
+
+library(genefilter)
+require(hgu133plus2.db)
+annotation(eset_rma) <- "hgu133plus2.db"
+filtered <- nsFilter(eset_rma, 
+                     require.entrez = TRUE, remove.dupEntrez = TRUE,
+                      var.filter=TRUE, var.func=IQR, var.cutoff=0.75, 
+                      filterByQuantile=TRUE, feature.exclude = "^AFFX")
+
+eset_filtered <-filtered$eset
+
+write.csv(exprs(eset_rma), file="./results/normalized.Data.csv")
+write.csv(exprs(eset_filtered), file="./results/normalized.Filtered.Data.csv")
+save(eset_rma, eset_filtered, file="./results/normalized.Data.Rda")
+
+# Se muestra el infrme de filtrado
+
+print(filtered$filter.log)
+
+# Se crea la matriz de diseño y se muestra esta
+
+library(limma)
+designMat<- model.matrix(~0+Target, pData(eset_rma))
+colnames(designMat) <- c("non48h","non96h","non0h","non7h","ale48h","ale96h","ale0h","ale7h")
+
+print(designMat)
+
+# Se crea la matriz de contrastes y se muestra esta
+
+cont.matrix <- makeContrasts (
+	ALEvsNONA.0h = ale0h-non0h,
+    ALEvsNONA.7h = ale7h-non7h,
+	ALEvsNONA.48h = ale48h-non48h,
+	ALEvsNONA.96h = ale96h-non96h,	
+	INT = (ale0h-non0h) - (ale7h-non7h)-(ale48h-non48h) - (ale96h-non96h),
+	levels=designMat)
+
+print(cont.matrix)
+
+# Se crea la matriz de de estimaciones usando el metodo limma
+
+library(limma)
+fit<-lmFit(eset_filtered, designMat)
+fit.main<-contrasts.fit(fit, cont.matrix)
+fit.main<-eBayes(fit.main)
+class(fit.main)
+
+# Se generan las deiferentes tablas de resultados de genes ordenados ajustados con FDR y se muestran las primeras lineas de cada una
+
+topTab_ALEvsNONA.0h <- topTable (fit.main, number=nrow(fit.main), coef="ALEvsNONA.0h", adjust="fdr") 
+head(topTab_ALEvsNONA.0h)
+
+topTab_ALEvsNONA.7h <- topTable (fit.main, number=nrow(fit.main), coef="ALEvsNONA.7h", adjust="fdr") 
+head(topTab_ALEvsNONA.7h)
+
+topTab_ALEvsNONA.48h <- topTable (fit.main, number=nrow(fit.main), coef="ALEvsNONA.48h", adjust="fdr") 
+head(topTab_ALEvsNONA.48h)
+
+topTab_ALEvsNONA.96h <- topTable (fit.main, number=nrow(fit.main), coef="ALEvsNONA.96h", adjust="fdr") 
+head(topTab_ALEvsNONA.96h)
+
+topTab_INT <- topTable (fit.main, number=nrow(fit.main), coef="INT", adjust="fdr") 
+head(topTab_INT)
+
+#Se generan las anotaciones de las toptable y se guardan en la carpeta de resultados
+
+annotatedTopTable <- function(topTab, anotPackage)
+{
+   topTab <- cbind(PROBEID=rownames(topTab), topTab)
+   myProbes <- rownames(topTab)
+   thePackage <- eval(parse(text = anotPackage))
+   geneAnots <- select(thePackage, myProbes, c("SYMBOL", "ENTREZID", "GENENAME"))
+   annotatedTopTab<- merge(x=geneAnots, y=topTab, by.x="PROBEID", by.y="PROBEID")
+ return(annotatedTopTab)
+}
+
+
+topAnnotated_topTab_ALEvsNONA.0h <- annotatedTopTable(topTab_ALEvsNONA.0h, anotPackage="hgu133plus2.db")
+topAnnotated_topTab_ALEvsNONA.7h <- annotatedTopTable(topTab_ALEvsNONA.7h, anotPackage="hgu133plus2.db")
+topAnnotated_topTab_ALEvsNONA.48h <- annotatedTopTable(topTab_ALEvsNONA.48h, anotPackage="hgu133plus2.db")
+topAnnotated_topTab_ALEvsNONA.96h <- annotatedTopTable(topTab_ALEvsNONA.96h, anotPackage="hgu133plus2.db")
+topAnnotated_topTab_INT <- annotatedTopTable(topTab_INT, anotPackage="hgu133plus2.db")
+
+write.csv(topAnnotated_topTab_ALEvsNONA.0h, file="./results/topAnnotated_topTab_ALEvsNONA.0h.csv")
+write.csv(topAnnotated_topTab_ALEvsNONA.7h, file="./results/topAnnotated_topTab_ALEvsNONA.7h.csv")
+write.csv(topAnnotated_topTab_ALEvsNONA.48h, file="./results/topAnnotated_topTab_ALEvsNONA.48h.csv")
+write.csv(topAnnotated_topTab_ALEvsNONA.96h, file="./results/topAnnotated_topTab_ALEvsNONA.96h.csv")
+write.csv(topAnnotated_topTab_INT, file="./results/topAnnotated_topTab_INT.csv")
+
+# Se generan los diferentes graficos tipo Volcano con los diferentes contrastes
+
+
+library(hgu133plus2.db)
+geneSymbols <- select(hgu133plus2.db, rownames(fit.main), c("SYMBOL"))
+SYMBOLS<- geneSymbols$SYMBOL
+volcanoplot(fit.main, coef=1, highlight=4, names=SYMBOLS, 
+             main=paste("Differentially expressed genes", colnames(cont.matrix)[1], sep="\n"))
+abline(v=c(-1,1))
+
+
+library(hgu133plus2.db)
+geneSymbols <- select(hgu133plus2.db, rownames(fit.main), c("SYMBOL"))
+SYMBOLS<- geneSymbols$SYMBOL
+volcanoplot(fit.main, coef=2, highlight=4, names=SYMBOLS, 
+             main=paste("Differentially expressed genes", colnames(cont.matrix)[1], sep="\n"))
+abline(v=c(-1,1))
+
+
+library(hgu133plus2.db)
+geneSymbols <- select(hgu133plus2.db, rownames(fit.main), c("SYMBOL"))
+SYMBOLS<- geneSymbols$SYMBOL
+volcanoplot(fit.main, coef=3, highlight=4, names=SYMBOLS, 
+             main=paste("Differentially expressed genes", colnames(cont.matrix)[1], sep="\n"))
+abline(v=c(-1,1))
+
+library(hgu133plus2.db)
+geneSymbols <- select(hgu133plus2.db, rownames(fit.main), c("SYMBOL"))
+SYMBOLS<- geneSymbols$SYMBOL
+volcanoplot(fit.main, coef=4, highlight=4, names=SYMBOLS, 
+             main=paste("Differentially expressed genes", colnames(cont.matrix)[1], sep="\n"))
+abline(v=c(-1,1))
+
+# Se ejecuta el metodo decideTest del pàquete Limma para la comparación entre distintas comparaciones, se guarda el resultado en res y se muestra el resumen
+library(limma)
+res<-decideTests(fit.main, method="separate", adjust.method="fdr", p.value=0.1, lfc=1)
+
+sum.res.rows<-apply(abs(res),1,sum)
+res.selected<-res[sum.res.rows!=0,] 
+print(summary(res))
+
+#Se genera un mapa de calor para ver la distribucón de los genes seleccionados
+
+probesInHeatmap <- rownames(res.selected)
+HMdata <- exprs(eset_filtered)[rownames(exprs(eset_filtered)) %in% probesInHeatmap,]
+geneSymbols <- select(hgu133plus2.db, rownames(HMdata), c("SYMBOL"))
+SYMBOLS<- geneSymbols$SYMBOL
+rownames(HMdata) <- SYMBOLS
+write.csv(HMdata, file = file.path("./results/data4Heatmap.csv"))
+
+my_palette <- colorRampPalette(c("blue", "red"))(n = 299)
+library(gplots)
+cc <- rainbow(ncol(HMdata), start=0, end=.3)
+```
+```{r heatmap, echo=FALSE}
+heatmap.2(HMdata,
+           Rowv = FALSE,
+           Colv = FALSE,
+           main = "Genes expresados diferencialmente \n FDR < 0,1, logFC >=1",
+           scale = "row",
+           col = my_palette,
+           sepcolor = "white",
+           sepwidth = c(0.05,0.05),
+           cexRow = 0.5,
+           cexCol = 0.9,
+           key = TRUE,
+           keysize = 1.5,
+           density.info = "histogram",
+           #ColSideColors = c(rep("red",3),rep("blue",3), rep("green",3), rep("yellow",3)),
+		   ColSideColors = cc,
+           tracecol = NULL,
+           dendrogram = "none",
+           srtCol = 30)
+		   
+
+#Se generan los resultados de significación biologica y se guardan en la carpeta results diferenciados por comparaciones
+#siempre que existan datos
+
+
+library(clusterProfiler)
+library(enrichplot)
+listOfTables <- list(ALEvsNONA.0h = topAnnotated_topTab_ALEvsNONA.0h, 
+                      ALEvsNONA.7h  = topAnnotated_topTab_ALEvsNONA.7h,
+                      ALEvsNONA.48h  = topAnnotated_topTab_ALEvsNONA.48h,
+                      ALEvsNONA.96h  = topAnnotated_topTab_ALEvsNONA.96h,					  
+                      INT = topAnnotated_topTab_INT)
+
+
+comparisonsNames <- names(listOfTables)
+#for (i in 1:length(listOfTables)){
+for (i in c(1,2,4,5)){
+	# select the toptable
+	topTab <- listOfTables[[i]]
+	comparison <- comparisonsNames[i]
+	# select the genes to be included in the analysis
+	topTab_adj <- subset(topTab, adj.P.Val<0.05)
+	selectedIDs <- topTab_adj[, "ENTREZID"]
+	resultados_g <- enrichGO(selectedIDs, OrgDb=org.Hs.eg.db, pvalueCutoff=0.05, qvalueCutoff=1)
+	resultados_k <- enrichKEGG( selectedIDs, organism = "human", keyType = "kegg", pvalueCutoff = 0.05,   pAdjustMethod = "BH", minGSSize = 10,  maxGSSize = 500, qvalueCutoff = 0.2,  use_internal_data = FALSE )
+	#cat("##################################")
+  #  cat("\nComparison: ", comparison,"\n")
+  #  print(head(resultados_e))
+	
+	if (length(rownames(resultados_g@result)) != 0) {
+		#cat("\nTic aqui Comparison: ", comparison,"\n")
+		write.csv(as.data.frame(resultados_g@result),file =paste0("./results/","clusterProfile.Results.",comparison,".csv"),row.names = FALSE)
+		pdf(file=paste0("./results/","clusterProfilePABarplot.",comparison,".pdf"))
+		library(enrichplot)
+	    print(barplot(resultados_g, showCategory=20, font.size = 4, title = paste0("clusterProfile Pathway Analysis for ", comparison,". Barplot")))
+		dev.off()
+		library(enrichplot)
+		
+		pdf(file = paste0("./results/","ClusterProfilercnetplot.",comparison,".pdf"))
+		print(cnetplot(resultados_k, categorySize = "geneNum", schowCategory = 15, vertex.label.cex = 0.75))
+		dev.off()
+		library(enrichplot)
+	}
+}
